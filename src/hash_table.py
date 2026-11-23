@@ -72,6 +72,10 @@ class HashTable:
     def load_factor(self) -> float:
         return self._size / len(self._buckets)
 
+    @property
+    def capacity(self) -> int:
+        return len(self._buckets)
+
     def __len__(self) -> int:
         return self._size
 

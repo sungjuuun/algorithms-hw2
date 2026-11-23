@@ -3,7 +3,8 @@ import threading
 import unittest
 from urllib.parse import urlencode
 
-from src.server import create_server
+from src.server import ShortenerRequestHandler, create_server
+from src.shortener import URLShortener
 
 
 class Headers:
@@ -97,18 +98,102 @@ class ServerTests(unittest.TestCase):
                 status, _, _ = self.request("GET", path)
                 self.assertEqual(status, 400)
 
+    def test_shortening_and_redirect_work_with_both_strategies(self):
+        for strategy in ("chaining", "linear_probing"):
+            with self.subTest(strategy=strategy):
+                self.server.shortener = URLShortener(strategy=strategy)
+                url = f"https://example.com/{strategy}"
+
+                status, _, body = self.post_form((("url", url),))
+
+                self.assertEqual(status, 200)
+                self.assertIn('href="/0"', body)
+                status, location, _ = self.request("GET", "/0")
+                self.assertEqual(status, 302)
+                self.assertEqual(location, url)
+
     def test_table_shows_actual_bucket_hash_and_escaped_key(self):
         url = "https://example.com/<script>alert(1)</script>"
-        self.server.shortener.shorten(url)
-        bucket = self.server.shortener._url_to_code.bucket_index(url)
+        for strategy in ("chaining", "linear_probing"):
+            with self.subTest(strategy=strategy):
+                self.server.shortener = URLShortener(strategy=strategy)
+                self.server.shortener.shorten(url)
+                table = self.server.shortener._url_to_code
+                initial_index = table.bucket_index(url)
+
+                status, _, body = self.request("GET", "/table")
+
+                self.assertEqual(status, 200)
+                self.assertIn("Horner hash", body)
+                self.assertIn(f"{initial_index}", body)
+                self.assertIn("&lt;script&gt;", body)
+                self.assertNotIn("<script>", body)
+                self.assertIn("<details>", body)
+                self.assertIn("Horner hash calculation", body)
+                self.assertIn("Final bucket:", body)
+                if strategy == "chaining":
+                    self.assertIn("Separate chaining", body)
+                    self.assertIn("Linked nodes", body)
+                    self.assertIn("NULL", body)
+                else:
+                    self.assertIn("Linear probing", body)
+                    self.assertIn("Stored slot", body)
+                    self.assertIn("Probe order", body)
+                    self.assertIn("Short link", body)
+
+    def test_horner_details_show_each_ordinal_and_intermediate_hash(self):
+        details = ShortenerRequestHandler._horner_explanation("ab", 1000, 105)
+
+        self.assertIn("<details>", details)
+        self.assertIn("ord = 97", details)
+        self.assertIn("(31 * 0 + 97) mod 1000 = 97", details)
+        self.assertIn("ord = 98", details)
+        self.assertIn("(31 * 97 + 98) mod 1000 = 105", details)
+        self.assertIn("Final bucket: 105", details)
+
+    def test_chaining_visualizes_colliding_nodes_and_short_links(self):
+        shortener = URLShortener(strategy="chaining", table_size=3)
+        matching_urls = []
+        for index in range(100):
+            url = f"https://example.com/{index}"
+            if shortener._url_to_code.bucket_index(url) == 2:
+                matching_urls.append(url)
+                if len(matching_urls) == 2:
+                    break
+        self.assertEqual(len(matching_urls), 2)
+        shortener.shorten(matching_urls[0])
+        shortener.shorten(matching_urls[1])
+        self.server.shortener = shortener
 
         status, _, body = self.request("GET", "/table")
 
         self.assertEqual(status, 200)
-        self.assertIn("Horner result (mod 4093)", body)
-        self.assertIn(f"<td>{bucket}</td><td>{bucket}</td>", body)
-        self.assertIn("&lt;script&gt;", body)
-        self.assertNotIn("<script>", body)
+        self.assertIn(" &rarr; ", body)
+        self.assertIn(" &rarr; NULL", body)
+        self.assertIn(matching_urls[0], body)
+        self.assertIn(matching_urls[1], body)
+        self.assertIn('href="/0">/0</a>', body)
+        self.assertIn('href="/1">/1</a>', body)
+
+    def test_linear_table_shows_wrapped_probe_path_and_final_slot(self):
+        shortener = URLShortener(strategy="linear_probing", table_size=3)
+        matching_urls = []
+        for index in range(100):
+            url = f"https://example.com/{index}"
+            if shortener._url_to_code.bucket_index(url) == 2:
+                matching_urls.append(url)
+                if len(matching_urls) == 2:
+                    break
+        self.assertEqual(len(matching_urls), 2)
+        shortener.shorten(matching_urls[0])
+        shortener.shorten(matching_urls[1])
+        self.server.shortener = shortener
+
+        status, _, body = self.request("GET", "/table")
+
+        self.assertEqual(status, 200)
+        self.assertIn("<td>2 &rarr; 0</td><td>0</td>", body)
+        self.assertIn("mod 3", body)
 
     def test_undefined_path_and_unsupported_method(self):
         status, _, _ = self.request("GET", "/missing")

@@ -9,6 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
+from src.linear_probing_hash_table import LinearProbingHashTable
 from src.shortener import URLShortener
 
 
@@ -151,34 +152,99 @@ class ShortenerRequestHandler(BaseHTTPRequestHandler):
 
     def _table_html(self) -> str:
         table = self.server.shortener._url_to_code
-        bucket_count = len(table._buckets)
+        bucket_count = table.capacity
         rows = []
-        for bucket_number, node in enumerate(table._buckets):
-            while node is not None:
-                horner_result = table.bucket_index(node.key)
+        if isinstance(table, LinearProbingHashTable):
+            for key, value in table.items():
+                initial_index = table.bucket_index(key)
+                probe_path = table.probe_path(key)
+                displayed_path = " &rarr; ".join(str(slot) for slot in probe_path)
+                escaped_code = html.escape(str(value), quote=True)
+                short_link = (
+                    f'<a href="/{escaped_code}">/{escaped_code}</a>'
+                )
                 rows.append(
                     "<tr>"
-                    f"<td>{bucket_number}</td>"
-                    f"<td>{horner_result}</td>"
-                    f"<td>{html.escape(node.key, quote=True)}</td>"
-                    f"<td>{html.escape(str(node.value), quote=True)}</td>"
+                    f"<td>{initial_index}</td>"
+                    f"<td>{self._horner_explanation(key, bucket_count, initial_index)}</td>"
+                    f"<td>{displayed_path}</td>"
+                    f"<td>{probe_path[-1]}</td>"
+                    f"<td>{html.escape(key, quote=True)}</td>"
+                    f"<td>{escaped_code}</td>"
+                    f"<td>{short_link}</td>"
                     "</tr>"
                 )
-                node = node.next
+            table_heading = f"Linear probing table, M={bucket_count}"
+            table_headers = (
+                "<th>Initial hash</th><th>Horner hash calculation</th>"
+                "<th>Probe order (checked slots)</th><th>Stored slot</th>"
+                "<th>URL key</th><th>Code</th><th>Short link</th>"
+            )
+            empty_row = '<tr><td colspan="7">No URLs stored</td></tr>'
+        else:
+            for bucket_number, node in enumerate(table._buckets):
+                chain_nodes = []
+                while node is not None:
+                    escaped_code = html.escape(str(node.value), quote=True)
+                    short_link = (
+                        f'<a href="/{escaped_code}">/{escaped_code}</a>'
+                    )
+                    chain_nodes.append(
+                        '<span class="chain-node">'
+                        f"<strong>URL key:</strong> "
+                        f"{html.escape(node.key, quote=True)}; "
+                        f"<strong>Code:</strong> {escaped_code}; "
+                        f"<strong>Short link:</strong> {short_link}; "
+                        f"{self._horner_explanation(node.key, bucket_count, bucket_number)}"
+                        "</span>"
+                    )
+                    node = node.next
+                if chain_nodes:
+                    chain = " &rarr; ".join((*chain_nodes, "NULL"))
+                    rows.append(
+                        f"<tr><td>{bucket_number}</td>"
+                        f'<td><div class="chain">{chain}</div></td></tr>'
+                    )
+            table_heading = f"Separate chaining table, M={bucket_count}"
+            table_headers = (
+                "<th>Bucket index</th><th>Linked nodes</th>"
+            )
+            empty_row = '<tr><td colspan="2">No URLs stored</td></tr>'
 
         if rows:
             table_body = "".join(rows)
         else:
-            table_body = '<tr><td colspan="4">No URLs stored</td></tr>'
+            table_body = empty_row
 
         return (
             "<!doctype html><html><body><h1>Hash table</h1>"
-            f"<p>Separate chaining table, M={bucket_count}</p>"
-            "<table><thead><tr><th>Bucket index</th>"
-            f"<th>Horner result (mod {bucket_count})</th>"
-            "<th>URL key</th><th>Code</th>"
+            f"<p>{table_heading}</p>"
+            f"<table><thead><tr>{table_headers}"
             f"</tr></thead><tbody>{table_body}</tbody></table>"
             "</body></html>"
+        )
+
+    @staticmethod
+    def _horner_explanation(key: str, modulus: int, result: int) -> str:
+        value = 0
+        steps = ["<li>h<sub>0</sub> = 0</li>"]
+        for position, character in enumerate(key, start=1):
+            previous_value = value
+            next_value = (31 * value + ord(character)) % modulus
+            steps.append(
+                f"<li>{html.escape(repr(character), quote=True)}: "
+                f"ord = {ord(character)}; "
+                f"h<sub>{position}</sub> = "
+                f"(31 * {previous_value} + {ord(character)}) "
+                f"mod {modulus} = {next_value}</li>"
+            )
+            value = next_value
+        if value != result:
+            raise RuntimeError("Horner explanation does not match the table bucket")
+        return (
+            f"<details><summary>Horner hash calculation for bucket {result}"
+            f"</summary><ol>{''.join(steps)}</ol>"
+            f"<p>Final bucket: {value}</p></details>"
         )
 
     def _send_html(self, status: HTTPStatus, body: str) -> None:
@@ -226,9 +292,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the URL shortener server.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--strategy",
+        choices=("chaining", "linear_probing"),
+        default="chaining",
+    )
     args = parser.parse_args()
 
-    server = create_server(args.host, args.port)
+    server = create_server(
+        args.host,
+        args.port,
+        URLShortener(strategy=args.strategy),
+    )
     print(f"Serving on http://{args.host}:{server.server_port}")
     try:
         server.serve_forever()
